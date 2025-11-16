@@ -1,0 +1,13 @@
+{
+  "name": "ai-processor",
+  "version": "1.0.0",
+  "description": "Dedicared service to classify messages and generate automated replies.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "firebase-admin": "^12.1.1"
+  }
+}
