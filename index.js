@@ -58,7 +58,18 @@ async function callGeminiAPI(payload) {
         }
         const result = await response.json();
         const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
-        return jsonText ? JSON.parse(jsonText) : null;
+
+        if (jsonText) {
+            try {
+                // Safely parse JSON
+                return JSON.parse(jsonText);
+            } catch (jsonError) {
+                console.error("❌ Failed to parse JSON response:", jsonError.message, "Raw Text:", jsonText.substring(0, 100) + "...");
+                return null;
+            }
+        }
+        return null;
+
     } catch (err) {
         console.error("❌ Gemini API call failed:", err.message);
         return null;
@@ -112,8 +123,37 @@ async function generateReply(messageBody, intent, isReturningClient, isQualified
         contents: [{ parts: [{ text: `Client Message: "${messageBody}"` }] }],
         systemInstruction: { parts: [{ text: systemPrompt }] }
     };
+    // Note: The generateReply function assumes the reply is the raw text part of the response,
+    // which is not strictly a JSON object. We adjust the return value handling slightly.
     const result = await callGeminiAPI(payload);
-    return result?.reply || "Thank you. We'll get back shortly.";
+    // When not using responseMimeType: "application/json", callGeminiAPI returns the parsed text if successful.
+    // If the model did not respond with JSON, we need to re-fetch the raw text.
+    // However, since callGeminiAPI is currently designed to return only the JSON payload, 
+    // we must adapt. For non-JSON calls, we'll need a minor refactor in callGeminiAPI 
+    // to return the raw text, OR we temporarily make a less efficient direct fetch call for the reply.
+    // For simplicity, we assume the model returns a simple object { reply: "..." } structure 
+    // (even though the system prompt doesn't enforce it) OR we adjust callGeminiAPI's return.
+
+    // A safer, more robust approach is to adjust callGeminiAPI to only handle JSON, 
+    // and create a separate function for text generation. 
+    // For this update, we will assume the model *sometimes* returns text directly or a {text: "..."} structure 
+    // that the API helper cannot reliably parse as JSON.
+    
+    // Instead of reusing callGeminiAPI which is tailored for JSON, we use a dedicated function 
+    // that fetches the raw text reply. (This deviates slightly from the consolidation goal 
+    // but is necessary for the mixed response types).
+    try {
+        const replyResponse = await fetch(GEMINI_API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const replyResult = await replyResponse.json();
+        return replyResult.candidates?.[0]?.content?.parts?.[0]?.text || "Thank you. We'll get back shortly.";
+    } catch (err) {
+        console.error("❌ Reply generation failed:", err.message);
+        return "Thank you. We'll get back shortly.";
+    }
 }
 
 // --- Main Processor ---
@@ -124,6 +164,10 @@ async function processMessage(doc) {
     const phoneNumber = message.phoneNumber || "unknown_phone";
 
     // Prevent duplicate processing
+    if (message.processing) {
+        console.log(`⏳ [${userId}] Skipping ${docId.substring(0, 10)}... already processing.`);
+        return;
+    }
     await doc.ref.update({ processing: true });
 
     try {
@@ -137,7 +181,9 @@ async function processMessage(doc) {
         let isQualified = false;
         let leadPriority = "Low";
 
-        let extractedData = { name: null, email: null };
+        // Qualified Lead Data Storage
+        let qualifiedLeadDocRef = null;
+        let currentLeadData = { name: null, email: null };
 
         // Check existing lead
         if (classification.isLead) {
@@ -159,26 +205,42 @@ async function processMessage(doc) {
                 .get();
 
             if (!existingQualifiedSnap.empty) {
+                // Lead is already qualified
+                qualifiedLeadDocRef = existingQualifiedSnap.docs[0].ref;
+                currentLeadData = existingQualifiedSnap.docs[0].data();
                 isQualified = true;
-                leadPriority = existingQualifiedSnap.docs[0].data().priority || "High";
+                leadPriority = currentLeadData.priority || "High";
             } else {
-                // Qualification
+                // Qualification needed
                 const qual = await qualifyLead(message.body, totalMessages, classification.intent);
                 isQualified = qual.isQualified;
                 leadPriority = qual.priority;
                 await delay(200);
             }
 
-            // Extraction if qualified
+            let extractedData = { name: null, email: null };
+
+            // Extraction if qualified and data is missing
             if (isQualified) {
-                extractedData = await extractData(message.body);
-                await delay(200);
+                const missingName = !currentLeadData.name;
+                const missingEmail = !currentLeadData.email;
+                
+                if (missingName || missingEmail) {
+                    // Only run extraction if we are missing name or email
+                    extractedData = await extractData(message.body);
+                    await delay(200);
+
+                    // Update local data with newly extracted info
+                    currentLeadData.name = currentLeadData.name || extractedData.name;
+                    currentLeadData.email = currentLeadData.email || extractedData.email;
+                }
             }
+            
+            // Re-check missing fields after (potential) extraction for reply generation
+            const missingName = !currentLeadData.name;
+            const missingEmail = !currentLeadData.email;
 
             // Generate Reply
-            const missingName = !extractedData.name;
-            const missingEmail = !extractedData.email;
-
             const autoReply = await generateReply(
                 message.body,
                 classification.intent,
@@ -189,26 +251,34 @@ async function processMessage(doc) {
             );
             await delay(200);
 
-            // Save qualified lead
+            // Save/Update qualified lead
             if (isQualified) {
-                const qualifiedLeadSnap = await db.collection(QUALIFIED_LEADS_COLLECTION)
-                    .where('userId', '==', userId)
-                    .limit(1)
-                    .get();
-                if (qualifiedLeadSnap.empty) {
-                    await db.collection(QUALIFIED_LEADS_COLLECTION).add({
-                        userId,
-                        phoneNumber,
-                        rawMessageId: docId,
-                        intent: classification.intent,
-                        priority: leadPriority,
-                        messageCount: totalMessages,
-                        autoReplyText: autoReply,
-                        name: extractedData.name,
-                        email: extractedData.email,
-                        timestamp: admin.firestore.Timestamp.now()
-                    });
+                const qualifiedLeadUpdate = {
+                    userId,
+                    phoneNumber,
+                    rawMessageId: docId,
+                    intent: classification.intent,
+                    priority: leadPriority,
+                    messageCount: totalMessages,
+                    autoReplyText: autoReply,
+                    name: currentLeadData.name,
+                    email: currentLeadData.email,
+                    timestamp: admin.firestore.Timestamp.now()
+                };
+
+                if (!qualifiedLeadDocRef) {
+                    // Create new qualified lead record
+                    await db.collection(QUALIFIED_LEADS_COLLECTION).add(qualifiedLeadUpdate);
                     console.log(`🚀 [${userId}] New qualified lead created.`);
+                } else {
+                    // Update existing qualified lead record (only necessary fields)
+                    await qualifiedLeadDocRef.update({
+                        name: currentLeadData.name, // Will update if it was null before
+                        email: currentLeadData.email, // Will update if it was null before
+                        messageCount: totalMessages,
+                        lastActive: admin.firestore.Timestamp.now()
+                    });
+                    console.log(`⭐ [${userId}] Qualified lead updated.`);
                 }
             }
 
@@ -249,7 +319,7 @@ async function processMessage(doc) {
         }
 
     } catch (err) {
-        console.error(`❌ [${userId}] Processing failed:`, err.message);
+        console.error(`❌ [${userId}] Processing failed for ${docId}:`, err.message);
         await doc.ref.update({ processing: false });
     }
 }
@@ -263,11 +333,14 @@ function startLeadProcessor() {
 
     console.log(`🔄 Starting live queue monitor on '${RAW_MESSAGES_COLLECTION}'`);
 
+    // Listen for new, unprocessed messages (processed == false) AND not currently being processed (processing == false)
     db.collection(RAW_MESSAGES_COLLECTION)
         .where('processed', '==', false)
+        .where('processing', '==', false) // Added filter to reduce redundant snapshot processing
         .onSnapshot(async snapshot => {
             for (const change of snapshot.docChanges()) {
-                if (change.type === 'added') {
+                if (change.type === 'added' || (change.type === 'modified' && change.doc.data().processed === false && change.doc.data().processing === false)) {
+                    // Process 'added' and 'modified' that may appear due to failed processing/re-queue
                     await processMessage(change.doc);
                 }
             }
