@@ -3,6 +3,22 @@ require('dotenv').config();
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 
+// --- Global Error Handlers (FIX: Added to catch silent crashes) ---
+
+process.on('uncaughtException', (err) => {
+    // Catches synchronous errors that crash the process immediately.
+    console.error('❌ FATAL: Uncaught Exception! The service is crashing.', err);
+    // Explicitly exit so Railway restarts the service.
+    process.exit(1); 
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    // Catches asynchronous errors (common in Firestore listeners or API calls).
+    console.error('❌ FATAL: Unhandled Rejection at:', promise, 'Reason:', reason);
+    // Explicitly exit so Railway restarts the service.
+    process.exit(1);
+});
+
 // --- Global Variables ---
 const RAW_MESSAGES_COLLECTION = 'raw_messages';
 const LEADS_COLLECTION = 'leads';
@@ -112,7 +128,7 @@ async function extractData(messageBody) {
     return result || { name: null, email: null };
 }
 
-// --- NEW/UPDATED: Dedicated Text Generation for Reply ---
+// --- Dedicated Text Generation for Reply (FIX: Uses direct fetch for text output) ---
 async function generateReply(messageBody, intent, isReturningClient, isQualified, missingName, missingEmail) {
     const systemPrompt = isQualified
         ? (missingName || missingEmail
@@ -125,7 +141,6 @@ async function generateReply(messageBody, intent, isReturningClient, isQualified
         systemInstruction: { parts: [{ text: systemPrompt }] }
     };
     
-    // NOTE: This uses a direct fetch call for text generation to avoid the JSON parsing failure
     try {
         const response = await fetch(GEMINI_API_URL, {
             method: 'POST',
@@ -139,7 +154,6 @@ async function generateReply(messageBody, intent, isReturningClient, isQualified
         const result = await response.json();
         const replyText = result.candidates?.[0]?.content?.parts?.[0]?.text;
         
-        // Log the successful reply text (not JSON)
         console.log(`💬 Reply Generated: ${replyText ? replyText.substring(0, Math.min(replyText.length, 50)) + "..." : "Default"}`);
         
         return replyText || "Thank you. We'll get back shortly.";
@@ -312,6 +326,7 @@ async function processMessage(doc) {
         }
 
     } catch (err) {
+        // Catches errors specific to the message processing loop
         console.error(`❌ [${userId}] Processing failed for ${docId}:`, err.message);
         await doc.ref.update({ processing: false });
     }
@@ -329,7 +344,7 @@ function startLeadProcessor() {
     // Listen for new, unprocessed messages (processed == false) AND not currently being processed (processing == false)
     db.collection(RAW_MESSAGES_COLLECTION)
         .where('processed', '==', false)
-        .where('processing', '==', false) // Added filter to reduce redundant snapshot processing
+        .where('processing', '==', false)
         .onSnapshot(async snapshot => {
             for (const change of snapshot.docChanges()) {
                 if (change.type === 'added' || (change.type === 'modified' && change.doc.data().processed === false && change.doc.data().processing === false)) {
