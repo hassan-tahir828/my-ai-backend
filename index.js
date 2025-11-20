@@ -40,7 +40,7 @@ function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- Gemini API calls ---
+// --- Gemini API calls (JSON only) ---
 async function callGeminiAPI(payload) {
     if (!GEMINI_API_KEY) {
         console.error("❌ GEMINI_API_KEY missing.");
@@ -64,7 +64,7 @@ async function callGeminiAPI(payload) {
                 // Safely parse JSON
                 return JSON.parse(jsonText);
             } catch (jsonError) {
-                console.error("❌ Failed to parse JSON response:", jsonError.message, "Raw Text:", jsonText.substring(0, 100) + "...");
+                console.error("❌ Failed to parse JSON response:", jsonError.message, "Raw Text:", jsonText.substring(0, Math.min(jsonText.length, 100)) + (jsonText.length > 100 ? "..." : ""));
                 return null;
             }
         }
@@ -112,44 +112,37 @@ async function extractData(messageBody) {
     return result || { name: null, email: null };
 }
 
+// --- NEW/UPDATED: Dedicated Text Generation for Reply ---
 async function generateReply(messageBody, intent, isReturningClient, isQualified, missingName, missingEmail) {
     const systemPrompt = isQualified
         ? (missingName || missingEmail
-            ? `Ask for missing info. Keep reply <= 3 sentences.`
+            ? `Ask for missing info (name and/or email). Keep reply <= 3 sentences.`
             : `Confirm info received. Reply in 1 sentence.`)
-        : `Answer query concisely, offer call. <=5 sentences.`;
+        : `Answer query concisely, offer call. Keep reply <=5 sentences.`;
 
     const payload = {
         contents: [{ parts: [{ text: `Client Message: "${messageBody}"` }] }],
         systemInstruction: { parts: [{ text: systemPrompt }] }
     };
-    // Note: The generateReply function assumes the reply is the raw text part of the response,
-    // which is not strictly a JSON object. We adjust the return value handling slightly.
-    const result = await callGeminiAPI(payload);
-    // When not using responseMimeType: "application/json", callGeminiAPI returns the parsed text if successful.
-    // If the model did not respond with JSON, we need to re-fetch the raw text.
-    // However, since callGeminiAPI is currently designed to return only the JSON payload, 
-    // we must adapt. For non-JSON calls, we'll need a minor refactor in callGeminiAPI 
-    // to return the raw text, OR we temporarily make a less efficient direct fetch call for the reply.
-    // For simplicity, we assume the model returns a simple object { reply: "..." } structure 
-    // (even though the system prompt doesn't enforce it) OR we adjust callGeminiAPI's return.
-
-    // A safer, more robust approach is to adjust callGeminiAPI to only handle JSON, 
-    // and create a separate function for text generation. 
-    // For this update, we will assume the model *sometimes* returns text directly or a {text: "..."} structure 
-    // that the API helper cannot reliably parse as JSON.
     
-    // Instead of reusing callGeminiAPI which is tailored for JSON, we use a dedicated function 
-    // that fetches the raw text reply. (This deviates slightly from the consolidation goal 
-    // but is necessary for the mixed response types).
+    // NOTE: This uses a direct fetch call for text generation to avoid the JSON parsing failure
     try {
-        const replyResponse = await fetch(GEMINI_API_URL, {
+        const response = await fetch(GEMINI_API_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const replyResult = await replyResponse.json();
-        return replyResult.candidates?.[0]?.content?.parts?.[0]?.text || "Thank you. We'll get back shortly.";
+        if (!response.ok) {
+            console.error(`❌ Reply API HTTP Error: ${response.status} ${response.statusText}`);
+            return "Thank you. We'll get back shortly.";
+        }
+        const result = await response.json();
+        const replyText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        
+        // Log the successful reply text (not JSON)
+        console.log(`💬 Reply Generated: ${replyText ? replyText.substring(0, Math.min(replyText.length, 50)) + "..." : "Default"}`);
+        
+        return replyText || "Thank you. We'll get back shortly.";
     } catch (err) {
         console.error("❌ Reply generation failed:", err.message);
         return "Thank you. We'll get back shortly.";
