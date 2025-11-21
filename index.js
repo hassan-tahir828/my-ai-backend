@@ -3,6 +3,7 @@ require('dotenv').config();
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 const pLimit = require('p-limit');
+const crypto = require('crypto'); // Added crypto module
 
 // --- Global Variables ---
 const RAW_MESSAGES_COLLECTION = 'raw_messages';
@@ -13,6 +14,7 @@ const GEMINI_API_MODEL = "gemini-2.5-flash";
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_API_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const CONCURRENCY_LIMIT = 5; // Max concurrent messages
 const limit = pLimit(CONCURRENCY_LIMIT);
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // New ENV var
 
 let db;
 
@@ -24,9 +26,37 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ Unhandled Rejection at:', promise, 'Reason:', reason);
 });
 
+// -------------------------
+// 🔒 DECRYPTION HELPER
+// -------------------------
+function decrypt({ encryptedBody, iv, authTag }) {
+    if (!encryptedBody || !iv || !authTag) return "";
+
+    try {
+        const key = Buffer.from(ENCRYPTION_KEY, 'utf-8');
+        const ivBuffer = Buffer.from(iv, 'hex');
+        const authTagBuffer = Buffer.from(authTag, 'hex');
+        const encryptedTextBuffer = Buffer.from(encryptedBody, 'hex');
+
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, ivBuffer);
+        decipher.setAuthTag(authTagBuffer);
+
+        let decrypted = decipher.update(encryptedTextBuffer, 'buffer', 'utf-8');
+        decrypted += decipher.final('utf-8');
+        return decrypted;
+    } catch (err) {
+        console.error("❌ Decryption failed:", err.message);
+        return ""; // Return empty string on failure
+    }
+}
+
+
 // --- Firebase Initialization ---
 function initializeFirebase() {
     try {
+        if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length !== 32) {
+            throw new Error("Missing or invalid ENCRYPTION_KEY. Must be 32 characters long.");
+        }
         const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_API_BASE64;
         if (!serviceAccountBase64) throw new Error("FIREBASE_SERVICE_ACCOUNT_API_BASE64 missing");
         const serviceAccountJson = Buffer.from(serviceAccountBase64, 'base64').toString('utf8');
@@ -95,6 +125,7 @@ async function callGeminiAPI(payload) {
 
 // --- Message classification / qualification / extraction ---
 async function classifyMessage(messageBody) {
+    // messageBody is now the decrypted text
     const payload = {
         contents: [{ parts: [{ text: `Client Message: "${messageBody}"` }] }],
         systemInstruction: { parts: [{ text: "You are an expert lead classifier. Respond ONLY with JSON { isLead: boolean, intent: string }." }] },
@@ -104,6 +135,7 @@ async function classifyMessage(messageBody) {
 }
 
 async function qualifyLead(messageBody, totalMessages, intent) {
+    // messageBody is now the decrypted text
     const payload = {
         contents: [{ parts: [{ text: `Current Message: "${messageBody}", Intent: "${intent}", Total Messages: ${totalMessages}` }] }],
         systemInstruction: { parts: [{ text: "Return JSON { isQualified: boolean, priority: 'Low'|'Medium'|'High' }." }] },
@@ -113,6 +145,7 @@ async function qualifyLead(messageBody, totalMessages, intent) {
 }
 
 async function extractData(messageBody) {
+    // messageBody is now the decrypted text
     const payload = {
         contents: [{ parts: [{ text: `Client Message: "${messageBody}"` }] }],
         systemInstruction: { parts: [{ text: "Extract Name and Email. Return { name: string|null, email: string|null }." }] },
@@ -123,6 +156,7 @@ async function extractData(messageBody) {
 
 // --- Generate Reply ---
 async function generateReply(messageBody, intent, isReturningClient, isQualified, missingName, missingEmail) {
+    // messageBody is now the decrypted text
     const systemPrompt = isQualified
         ? (missingName || missingEmail ? "Ask for missing info (name/email). Keep reply <= 3 sentences." : "Confirm info received. Reply in 1 sentence.")
         : "Answer query concisely, offer call. <=5 sentences.";
@@ -153,8 +187,21 @@ async function processMessage(doc) {
 
     try {
         console.log(`📨 Processing ${docId} [${userId}]...`);
+        
+        // Decrypt the message body in memory
+        const decryptedBody = decrypt({ 
+            encryptedBody: message.encryptedBody, 
+            iv: message.iv, 
+            authTag: message.authTag 
+        });
 
-        const classification = await classifyMessage(message.body);
+        if (!decryptedBody) {
+             console.error(`❌ Processing failed for ${docId}: Decryption error or empty message.`);
+             await doc.ref.update({ processing: false });
+             return;
+        }
+
+        const classification = await classifyMessage(decryptedBody);
         await delay(100);
 
         let isReturningClient = false;
@@ -176,7 +223,7 @@ async function processMessage(doc) {
                 isQualified = true;
                 leadPriority = currentLeadData.priority || "High";
             } else {
-                const qual = await qualifyLead(message.body, totalMessages, classification.intent);
+                const qual = await qualifyLead(decryptedBody, totalMessages, classification.intent);
                 isQualified = qual.isQualified;
                 leadPriority = qual.priority;
                 await delay(100);
@@ -184,14 +231,15 @@ async function processMessage(doc) {
 
             // Extract missing data
             if (isQualified && (!currentLeadData.name || !currentLeadData.email)) {
-                const extracted = await extractData(message.body);
+                const extracted = await extractData(decryptedBody);
                 currentLeadData.name = currentLeadData.name || extracted.name;
                 currentLeadData.email = currentLeadData.email || extracted.email;
             }
 
             const missingName = !currentLeadData.name;
             const missingEmail = !currentLeadData.email;
-            const autoReply = await generateReply(message.body, classification.intent, isReturningClient, isQualified, missingName, missingEmail);
+            // Pass decrypted body to generateReply
+            const autoReply = await generateReply(decryptedBody, classification.intent, isReturningClient, isQualified, missingName, missingEmail);
             await delay(100);
 
             // Save qualified lead
@@ -206,7 +254,8 @@ async function processMessage(doc) {
             }
 
             // Save/update general lead
-            if (!isReturningClient) await db.collection(LEADS_COLLECTION).add({ userId, phoneNumber, intent: classification.intent, firstMessageBody: message.body, messageCount: totalMessages, timestamp: admin.firestore.Timestamp.now() });
+            // Store the first message's DECRYPTED body (for easier lookup/display of the initial query)
+            if (!isReturningClient) await db.collection(LEADS_COLLECTION).add({ userId, phoneNumber, intent: classification.intent, firstMessageBody: decryptedBody, messageCount: totalMessages, timestamp: admin.firestore.Timestamp.now() });
             else await existingLeadSnap.docs[0].ref.update({ intent: classification.intent, messageCount: totalMessages, lastActive: admin.firestore.Timestamp.now() });
 
             // Mark raw message processed
@@ -226,6 +275,7 @@ async function processMessage(doc) {
 // --- Polling Processor (Stable for Railway) ---
 async function pollMessages() {
     const snapshot = await db.collection(RAW_MESSAGES_COLLECTION).where('processed', '==', false).where('processing', '==', false).get();
+    // No change to polling logic
     snapshot.docs.forEach(doc => limit(() => processMessage(doc)));
 }
 
