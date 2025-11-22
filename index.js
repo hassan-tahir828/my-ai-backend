@@ -3,20 +3,23 @@ require('dotenv').config();
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
 const pLimit = require('p-limit');
-const crypto = require('crypto'); // <-- ADDED: For decryption
-const express = require('express'); // <-- ADDED: For Railway health check
+const crypto = require('crypto');
+const express = require('express');
 
-// --- Global Variables ---
-const PORT = process.env.PORT || 3000; // Define Port for Health Check
+// Debug: path to the log you uploaded for debugging. (Dev note: file URL)
+const DEBUG_LOG_FILE_URL = "file:///mnt/data/logs.1763827710412.json";
+
+// --- Config / Globals ---
+const PORT = process.env.PORT || 3000;
 const RAW_MESSAGES_COLLECTION = 'raw_messages';
 const LEADS_COLLECTION = 'leads';
 const QUALIFIED_LEADS_COLLECTION = 'qualified_leads';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_API_MODEL = "gemini-2.5-flash";
+const GEMINI_API_MODEL = process.env.GEMINI_API_MODEL || "gemini-2.5-flash";
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_API_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-const CONCURRENCY_LIMIT = 5; // Max concurrent messages
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "5", 10);
 const limit = pLimit(CONCURRENCY_LIMIT);
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // Get key from env
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // 64 hex chars
 
 let db;
 
@@ -29,12 +32,11 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // -------------------------
-// 🔒 DECRYPTION HELPER (FIXED: Uses secure hex key encoding)
+// 🔒 Decrypt helper (AES-256-GCM, hex key/iv/tag)
 // -------------------------
 function decrypt(encryptedBody, iv, authTag) {
     if (!encryptedBody || !iv || !authTag) return null;
     try {
-        // SECURITY FIX: Use 'hex' encoding to correctly interpret the 64-char key
         const key = Buffer.from(ENCRYPTION_KEY, 'hex'); 
         const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'));
         decipher.setAuthTag(Buffer.from(authTag, 'hex'));
@@ -45,20 +47,19 @@ function decrypt(encryptedBody, iv, authTag) {
         return decrypted;
     } catch (e) {
         console.error("❌ Decryption Failed:", e.message);
-        return null; // Return null on failure
+        return null;
     }
 }
 
 // -------------------------
-// 🔥 FIREBASE INITIALIZATION (FIXED: Added key validation)
+// 🔥 Firebase Initialization
 // -------------------------
 function initializeFirebase() {
     try {
-        // SECURITY CHECK: Ensure ENCRYPTION_KEY is valid
         if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(ENCRYPTION_KEY)) {
             throw new Error("Missing or invalid ENCRYPTION_KEY. Must be a 64-character hexadecimal string.");
         }
-        
+
         const serviceAccountBase64 = process.env.FIREBASE_SERVICE_ACCOUNT_API_BASE64;
         if (!serviceAccountBase64) throw new Error("FIREBASE_SERVICE_ACCOUNT_API_BASE64 missing");
         const serviceAccountJson = Buffer.from(serviceAccountBase64, 'base64').toString('utf-8');
@@ -78,125 +79,288 @@ function initializeFirebase() {
 }
 
 // -------------------------
-// 🤖 CORE AI FUNCTIONS (Stubs for the logic)
+// 🧠 Gemini multi-task call
+// This asks Gemini to return a JSON object with these fields:
+// {
+//   reply: "text reply here",
+//   intent: "intent_label",
+//   isLead: true|false,
+//   missingName: true|false,
+//   missingEmail: true|false,
+//   extracted: { name: "...", email: "..." }
+// }
 // -------------------------
-
-async function generateAIResponse(prompt) {
+async function callGeminiMultiTask(messageBody, context = {}) {
     if (!GEMINI_API_KEY) {
         console.warn("⚠️ GEMINI_API_KEY is not set. Skipping AI calls.");
-        return { text: "The AI is currently unavailable.", classification: { isLead: false, intent: "error" }, extraction: null };
-    }
-
-    // This block would contain the logic to call the Gemini API
-    // and process the response for classification, extraction, and reply.
-    
-    // Placeholder logic:
-    if (prompt.toLowerCase().includes("quote")) {
-        return { 
-            text: "Thank you for your inquiry about a quote! I need to know your company name and project scope to provide an accurate estimate.", 
-            classification: { isLead: true, intent: "quote_request" }, 
-            extraction: { companyName: "Unknown", scope: "Quote Request" } 
+        return {
+            reply: "The AI is currently unavailable.",
+            intent: "error",
+            isLead: false,
+            missingName: true,
+            missingEmail: true,
+            extracted: {}
         };
     }
-    
-    return { 
-        text: "Thank you for your message. I'm processing your request.", 
-        classification: { isLead: true, intent: "general_inquiry" }, 
-        extraction: null 
+
+    // Build an explicit system instruction asking for strict JSON output
+    const systemInstruction = `
+You are an assistant for an immigration consultancy. Given the client's message, produce TWO things and output ONLY a JSON object:
+1) A concise reply message suitable to send back on WhatsApp (<= 5 sentences). The reply should be professional and follow the business rules described below.
+2) Structured metadata describing intent and contact extraction.
+
+Return valid JSON with keys: reply, intent, isLead, missingName, missingEmail, extracted.
+- intent: a short string (e.g., "study_visa", "work_visa", "quote_request", "general_inquiry").
+- isLead: true if this conversation should be treated as a lead (wants service/quote/consultation), otherwise false.
+- missingName / missingEmail: booleans indicating whether the user's full name or email is missing.
+- extracted: object with possible fields name and email (strings) if found, otherwise empty strings.
+
+Business rules:
+- If the user asks for a quote or mentions "price/fee/cost/quote", set intent to "quote_request" and isLead true.
+- If user asks about "study visa", "student visa", set intent "study_visa".
+- If user asks for next steps / assessment / consultation, mark isLead true.
+- For name detection, consider common patterns (e.g., "My name is ...", "I am ...", signature). For email detection, find typical email patterns.
+- Keep reply concise, and if name/email missing and isLead true, ask only for the missing fields (do NOT ask for additional info).
+- If it seems to be a returning client (context.returningClient true), acknowledge return briefly.
+
+Important: Output STRICT JSON only (no extra explanation). Example:
+{
+  "reply": "Thanks — we need your full name and email to confirm the slot. We'll call you on this number.",
+  "intent": "quote_request",
+  "isLead": true,
+  "missingName": true,
+  "missingEmail": false,
+  "extracted": { "name": "", "email": "user@example.com" }
+}
+`;
+
+    // Compose user content
+    const userContent = `Client message: """${messageBody}""" 
+Context: ${JSON.stringify(context)}.
+Return only JSON.`;
+
+    const payload = {
+        contents: [{ parts: [{ text: userContent }] }],
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        // small generation config
+        // NOTE: exact model config field names may vary; keep conservative options
+        // We allow up to ~300 tokens in response for JSON
+        // If your environment requires different param names, adjust accordingly.
     };
+
+    try {
+        const response = await fetch(GEMINI_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            timeout: 30_000
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (!rawText) throw new Error("Gemini returned no text.");
+
+        // Attempt to extract JSON inside the rawText
+        // Some models may wrap the JSON in triple backticks or text; try to find the JSON substring.
+        const jsonMatch = rawText.match(/\{[\s\S]*\}$/);
+        const jsonText = jsonMatch ? jsonMatch[0] : rawText;
+
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonText);
+        } catch (parseErr) {
+            console.warn("⚠️ Failed to parse JSON from Gemini. Raw text:", rawText);
+            // As fallback, try to extract fields heuristically
+            parsed = {
+                reply: rawText,
+                intent: "unknown",
+                isLead: false,
+                missingName: true,
+                missingEmail: true,
+                extracted: {}
+            };
+        }
+
+        // Normalize expected fields
+        return {
+            reply: (parsed.reply || parsed.text || "").toString().trim(),
+            intent: (parsed.intent || "general_inquiry").toString(),
+            isLead: !!parsed.isLead,
+            missingName: !!parsed.missingName,
+            missingEmail: !!parsed.missingEmail,
+            extracted: parsed.extracted || {}
+        };
+
+    } catch (err) {
+        console.error("❌ Gemini multi-task call failed:", err.message);
+        return {
+            reply: "Thank you for your message. We are currently experiencing high volume but will reply to your inquiry shortly!",
+            intent: "error",
+            isLead: false,
+            missingName: true,
+            missingEmail: true,
+            extracted: {}
+        };
+    }
 }
 
+// -------------------------
+// 🧩 Helper: small sanitizers
+// -------------------------
+function sanitizeIntent(intent) {
+    if (!intent) return "general_inquiry";
+    return intent.toString().toLowerCase().replace(/\s+/g, "_");
+}
 
 // -------------------------
-// ⚙️ MESSAGE PROCESSOR (FIXED: Handles decryption failure)
+// ⚙️ Message Processor
 // -------------------------
-
 async function processMessage(doc) {
     const docId = doc.id;
     const message = doc.data();
 
+    // Avoid reprocessing
     if (message.processing) return;
-
     await doc.ref.update({ processing: true });
 
     const decryptedBody = decrypt(message.encryptedBody, message.iv, message.authTag);
 
-    // STABILITY FIX: If decryption fails, mark as processed and exit safely
     if (!decryptedBody) {
         console.error(`❌ Decryption failed for message ${docId}. Marking processed.`);
-        await doc.ref.update({ processed: true, processing: false, autoReplyText: "Error processing your message due to a decryption issue." });
+        await doc.ref.update({
+            processed: true,
+            processing: false,
+            autoReplyText: "Error processing your message due to a decryption issue."
+        });
         return;
     }
 
-    // 1. Get total message count for this lead (to determine if this is the first message)
+    // Determine total messages for this lead (simple heuristic)
     const leadKey = message.from;
-    const totalMessages = (await db.collection(RAW_MESSAGES_COLLECTION).where('from', '==', leadKey).get()).size;
+    const totalMessagesSnap = await db.collection(RAW_MESSAGES_COLLECTION).where('from', '==', leadKey).get();
+    const totalMessages = totalMessagesSnap.size;
 
     try {
-        // 2. Classify and Extract Data using AI (using decryptedBody)
-        const aiResult = await generateAIResponse(decryptedBody);
-        const { text: autoReply, classification, extraction } = aiResult;
-        
-        const isQualified = classification.intent === "quote_request"; // Example qualification logic
-        const leadPriority = isQualified ? 1 : 2; 
+        // Call Gemini to get structured reply + metadata
+        const context = {
+            returningClient: totalMessages > 1,
+            // you can add more context like lastIntent, timezone, etc.
+        };
 
-        // 3. Update/Create Lead Document
-        const existingLeadSnap = await db.collection(LEADS_COLLECTION).where('leadKey', '==', leadKey).get();
-        
-        if (classification.isLead) {
-            // Update the raw message document to trigger reply sending in the whatsapp backend
-            await doc.ref.update({ processed: true, isLead: classification.isLead, isQualified, priority: leadPriority, autoReplyText: autoReply, messageCount: totalMessages, replyPending: true, processing: false });
+        const aiResult = await callGeminiMultiTask(decryptedBody, context);
+        const { reply, intent, isLead, missingName, missingEmail, extracted } = aiResult;
 
-            // Update Lead Document
-            if (existingLeadSnap.empty) 
-                await db.collection(LEADS_COLLECTION).add({ leadKey, intent: classification.intent, firstMessageBody: decryptedBody, messageCount: totalMessages, timestamp: admin.firestore.Timestamp.now() });
-            else 
-                await existingLeadSnap.docs[0].ref.update({ intent: classification.intent, messageCount: totalMessages, lastActive: admin.firestore.Timestamp.now() });
+        const normalizedIntent = sanitizeIntent(intent);
+        const isQualified = (normalizedIntent === "quote_request") || isLead;
 
+        const leadPriority = isQualified ? 1 : 2;
+
+        // Update raw message doc to trigger send in WhatsApp backend
+        await doc.ref.update({
+            processed: true,
+            isLead,
+            isQualified,
+            priority: leadPriority,
+            autoReplyText: reply,
+            messageCount: totalMessages,
+            replyPending: true,
+            processing: false,
+            metadata: {
+                aiIntent: normalizedIntent,
+                aiExtracted: extracted,
+                missingName,
+                missingEmail
+            }
+        });
+
+        // Update or create Lead document
+        const existingLeadSnap = await db.collection(LEADS_COLLECTION).where('leadKey', '==', leadKey).limit(1).get();
+        const now = admin.firestore.Timestamp.now();
+
+        if (isLead) {
+            if (existingLeadSnap.empty) {
+                // Create new lead
+                await db.collection(LEADS_COLLECTION).add({
+                    leadKey,
+                    intent: normalizedIntent,
+                    firstMessageBody: decryptedBody,
+                    messageCount: totalMessages,
+                    extracted: extracted || {},
+                    missingName,
+                    missingEmail,
+                    priority: leadPriority,
+                    createdAt: now,
+                    lastActive: now
+                });
+            } else {
+                // Update existing lead
+                const leadRef = existingLeadSnap.docs[0].ref;
+                await leadRef.update({
+                    intent: normalizedIntent,
+                    messageCount: totalMessages,
+                    lastActive: now,
+                    extracted: admin.firestore.FieldValue.arrayUnion(extracted || {}),
+                    missingName,
+                    missingEmail,
+                    priority: leadPriority
+                });
+            }
             console.log(`✅ Message ${docId} processed. Reply pending.`);
         } else {
-            // Not a lead - just mark processed
-            await doc.ref.update({ processed: true, processing: false });
-            console.log(`❌ Not a lead. Marked processed.`);
+            console.log(`ℹ️ Message ${docId} processed. Not a lead.`);
         }
 
     } catch (err) {
         console.error(`❌ Processing failed for ${docId}:`, err.message);
+        // ensure we free up the processing flag so it can be retried if needed
         await doc.ref.update({ processing: false });
     }
 }
 
-// --- Polling Processor (Stable for Railway) ---
+// --- Polling Processor ---
 async function pollMessages() {
-    const snapshot = await db.collection(RAW_MESSAGES_COLLECTION).where('processed', '==', false).where('processing', '==', false).limit(CONCURRENCY_LIMIT).get();
-    snapshot.docs.forEach(doc => limit(() => processMessage(doc)));
+    try {
+        const snapshot = await db.collection(RAW_MESSAGES_COLLECTION)
+            .where('processed', '==', false)
+            .where('processing', '==', false)
+            .limit(CONCURRENCY_LIMIT)
+            .get();
+
+        snapshot.docs.forEach(doc => limit(() => processMessage(doc)));
+    } catch (err) {
+        console.error("❌ Polling error:", err.message);
+    }
 }
 
-// --- Start Polling ---
 function startLeadProcessor() {
     if (!db) { console.error("❌ Firestore not initialized"); return; }
-    console.log("🔄 Starting lead processor (poll every 2s)...");
+    console.log(`🔄 Starting lead processor (poll every 2s)...`);
     setInterval(pollMessages, 2000);
 }
 
 // -------------------------
-// 🌍 HEALTH CHECK SERVER (NEW FIX for Railway SIGTERM)
+// 🌍 Health Check Server (Railway friendly)
 // -------------------------
 const app = express();
-
-// Simple health check route
 app.get("/", (req, res) => {
     res.json({
         status: "AI Processor Running and Polling",
         timestamp: new Date().toISOString(),
+        debugLog: DEBUG_LOG_FILE_URL
     });
 });
 
-// --- Execute ---
+// -------------------------
+// Start everything
+// -------------------------
 initializeFirebase();
 startLeadProcessor();
 
-// Start the HTTP server to pass Railway's health check
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`🌍 Health Check Server Running on port ${PORT}`);
 });
