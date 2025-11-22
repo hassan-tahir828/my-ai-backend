@@ -6,20 +6,19 @@ const pLimit = require('p-limit');
 const crypto = require('crypto');
 const express = require('express');
 
-// Debug: path to the log you uploaded for debugging. (Dev note: file URL)
+// Local debug log (uploaded file) — developer requested local path as URL
 const DEBUG_LOG_FILE_URL = "file:///mnt/data/logs.1763827710412.json";
 
 // --- Config / Globals ---
 const PORT = process.env.PORT || 3000;
 const RAW_MESSAGES_COLLECTION = 'raw_messages';
 const LEADS_COLLECTION = 'leads';
-const QUALIFIED_LEADS_COLLECTION = 'qualified_leads';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_API_MODEL = process.env.GEMINI_API_MODEL || "gemini-2.5-flash";
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_API_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "5", 10);
 const limit = pLimit(CONCURRENCY_LIMIT);
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // 64 hex chars
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // must be 64 hex chars (32 bytes)
 
 let db;
 
@@ -37,7 +36,7 @@ process.on('unhandledRejection', (reason, promise) => {
 function decrypt(encryptedBody, iv, authTag) {
     if (!encryptedBody || !iv || !authTag) return null;
     try {
-        const key = Buffer.from(ENCRYPTION_KEY, 'hex'); 
+        const key = Buffer.from(ENCRYPTION_KEY, 'hex');
         const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'hex'));
         decipher.setAuthTag(Buffer.from(authTag, 'hex'));
 
@@ -79,16 +78,9 @@ function initializeFirebase() {
 }
 
 // -------------------------
-// 🧠 Gemini multi-task call
-// This asks Gemini to return a JSON object with these fields:
-// {
-//   reply: "text reply here",
-//   intent: "intent_label",
-//   isLead: true|false,
-//   missingName: true|false,
-//   missingEmail: true|false,
-//   extracted: { name: "...", email: "..." }
-// }
+// 🧠 Gemini multi-task call (asks for JSON but we sanitize outputs)
+// - Soft 20-word suggestion is requested in system instruction (Option B)
+// - Model asked to output JSON, but we robustly extract JSON and sanitize the reply
 // -------------------------
 async function callGeminiMultiTask(messageBody, context = {}) {
     if (!GEMINI_API_KEY) {
@@ -103,49 +95,32 @@ async function callGeminiMultiTask(messageBody, context = {}) {
         };
     }
 
-    // Build an explicit system instruction asking for strict JSON output
     const systemInstruction = `
-You are an assistant for an immigration consultancy. Given the client's message, produce TWO things and output ONLY a JSON object:
-1) A concise reply message suitable to send back on WhatsApp (<= 5 sentences). The reply should be professional and follow the business rules described below.
-2) Structured metadata describing intent and contact extraction.
+You are an assistant for an immigration consultancy. Produce a JSON object and return ONLY valid JSON (no extra text outside JSON).
+The JSON keys must be: reply, intent, isLead, missingName, missingEmail, extracted.
 
-Return valid JSON with keys: reply, intent, isLead, missingName, missingEmail, extracted.
-- intent: a short string (e.g., "study_visa", "work_visa", "quote_request", "general_inquiry").
-- isLead: true if this conversation should be treated as a lead (wants service/quote/consultation), otherwise false.
-- missingName / missingEmail: booleans indicating whether the user's full name or email is missing.
-- extracted: object with possible fields name and email (strings) if found, otherwise empty strings.
+Rules for "reply":
+- First, answer the client's query concisely (aim to keep the answer under 20 words — soft limit, not strict).
+- Do NOT ask for name or email unless the conversation should be treated as a qualified lead (isLead true).
+- If the conversation is qualified and name/email are missing, the assistant may include a brief ask for the missing fields.
+- The reply text should be short, informative, and professional. If you must, use up to 2 short sentences, but prefer a very short single reply sentence.
+- Do NOT include any JSON code fences or commentary.
+- Example of intended reply content: "Study visa is possible for many applicants." (remember the soft 20-word target)
 
-Business rules:
-- If the user asks for a quote or mentions "price/fee/cost/quote", set intent to "quote_request" and isLead true.
-- If user asks about "study visa", "student visa", set intent "study_visa".
-- If user asks for next steps / assessment / consultation, mark isLead true.
-- For name detection, consider common patterns (e.g., "My name is ...", "I am ...", signature). For email detection, find typical email patterns.
-- Keep reply concise, and if name/email missing and isLead true, ask only for the missing fields (do NOT ask for additional info).
-- If it seems to be a returning client (context.returningClient true), acknowledge return briefly.
+Intent should be a short string like: "study_visa", "work_visa", "quote_request", "general_inquiry", etc.
+isLead should be true when the user is asking for service/quote/consultation or otherwise needs follow-up.
+missingName and missingEmail should be booleans.
+extracted should be an object with optional "name" and "email" fields if found, otherwise empty strings.
 
-Important: Output STRICT JSON only (no extra explanation). Example:
-{
-  "reply": "Thanks — we need your full name and email to confirm the slot. We'll call you on this number.",
-  "intent": "quote_request",
-  "isLead": true,
-  "missingName": true,
-  "missingEmail": false,
-  "extracted": { "name": "", "email": "user@example.com" }
-}
+Context: ${JSON.stringify(context)}
+Return valid JSON only.
 `;
 
-    // Compose user content
-    const userContent = `Client message: """${messageBody}""" 
-Context: ${JSON.stringify(context)}.
-Return only JSON.`;
+    const userContent = `Client message: """${messageBody}"""`;
 
     const payload = {
         contents: [{ parts: [{ text: userContent }] }],
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        // small generation config
-        // NOTE: exact model config field names may vary; keep conservative options
-        // We allow up to ~300 tokens in response for JSON
-        // If your environment requires different param names, adjust accordingly.
+        systemInstruction: { parts: [{ text: systemInstruction }] }
     };
 
     try {
@@ -153,7 +128,7 @@ Return only JSON.`;
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
-            timeout: 30_000
+            // node-fetch doesn't accept 'timeout' in fetch options in v2; environment may differ.
         });
 
         if (!response.ok) {
@@ -162,22 +137,24 @@ Return only JSON.`;
 
         const data = await response.json();
         const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
         if (!rawText) throw new Error("Gemini returned no text.");
 
-        // Attempt to extract JSON inside the rawText
-        // Some models may wrap the JSON in triple backticks or text; try to find the JSON substring.
-        const jsonMatch = rawText.match(/\{[\s\S]*\}$/);
-        const jsonText = jsonMatch ? jsonMatch[0] : rawText;
+        // Clean rawText: remove common code fences and extra text, then extract JSON substring
+        let cleanText = rawText.toString().trim();
+        cleanText = cleanText.replace(/```json/gi, "").replace(/```/g, "").trim();
+
+        // Try to find the JSON object in the returned text
+        const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+        const jsonText = jsonMatch ? jsonMatch[0] : cleanText;
 
         let parsed;
         try {
             parsed = JSON.parse(jsonText);
         } catch (parseErr) {
             console.warn("⚠️ Failed to parse JSON from Gemini. Raw text:", rawText);
-            // As fallback, try to extract fields heuristically
-            parsed = {
-                reply: rawText,
+            // Heuristic fallback: attempt to salvage by returning reply as rawText
+            return {
+                reply: cleanText.substring(0, 1000), // fallback
                 intent: "unknown",
                 isLead: false,
                 missingName: true,
@@ -186,7 +163,7 @@ Return only JSON.`;
             };
         }
 
-        // Normalize expected fields
+        // Normalize fields (safeguard types)
         return {
             reply: (parsed.reply || parsed.text || "").toString().trim(),
             intent: (parsed.intent || "general_inquiry").toString(),
@@ -199,7 +176,7 @@ Return only JSON.`;
     } catch (err) {
         console.error("❌ Gemini multi-task call failed:", err.message);
         return {
-            reply: "Thank you for your message. We are currently experiencing high volume but will reply to your inquiry shortly!",
+            reply: "Thank you for your message. We are currently experiencing high volume but will reply shortly.",
             intent: "error",
             isLead: false,
             missingName: true,
@@ -210,8 +187,19 @@ Return only JSON.`;
 }
 
 // -------------------------
-// 🧩 Helper: small sanitizers
+// 🧩 Helper: sanitize strings and counts
 // -------------------------
+function sanitizeTextForWhatsApp(text) {
+    if (!text) return "";
+    // Remove surrounding whitespace and ensure no JSON-like content
+    let t = text.toString().trim();
+    // Remove any remaining backticks
+    t = t.replace(/```/g, "");
+    // Collapse multiple blank lines to a single blank line
+    t = t.replace(/\n{3,}/g, "\n\n");
+    return t;
+}
+
 function sanitizeIntent(intent) {
     if (!intent) return "general_inquiry";
     return intent.toString().toLowerCase().replace(/\s+/g, "_");
@@ -224,7 +212,6 @@ async function processMessage(doc) {
     const docId = doc.id;
     const message = doc.data();
 
-    // Avoid reprocessing
     if (message.processing) return;
     await doc.ref.update({ processing: true });
 
@@ -240,33 +227,78 @@ async function processMessage(doc) {
         return;
     }
 
-    // Determine total messages for this lead (simple heuristic)
     const leadKey = message.from;
     const totalMessagesSnap = await db.collection(RAW_MESSAGES_COLLECTION).where('from', '==', leadKey).get();
     const totalMessages = totalMessagesSnap.size;
 
     try {
-        // Call Gemini to get structured reply + metadata
         const context = {
-            returningClient: totalMessages > 1,
-            // you can add more context like lastIntent, timezone, etc.
+            returningClient: totalMessages > 1
         };
 
+        // Get AI structured result
         const aiResult = await callGeminiMultiTask(decryptedBody, context);
-        const { reply, intent, isLead, missingName, missingEmail, extracted } = aiResult;
+        const { reply: aiReplyRaw, intent, isLead, missingName, missingEmail, extracted } = aiResult;
 
         const normalizedIntent = sanitizeIntent(intent);
         const isQualified = (normalizedIntent === "quote_request") || isLead;
-
         const leadPriority = isQualified ? 1 : 2;
 
-        // Update raw message doc to trigger send in WhatsApp backend
+        // Sanitize AI reply
+        const aiReply = sanitizeTextForWhatsApp(aiReplyRaw);
+
+        // Build final message according to rules:
+        // 1) Include AI's reply (under 20 words soft request — we trust the model)
+        // 2) If qualified AND missing fields, append requests for missing fields (each on its own line)
+        // 3) Then leave one blank line, then the disclaimer on its own line:
+        //    This is an AI generated reply
+        const messageLines = [];
+
+        // Ensure answer is first (AI reply)
+        if (aiReply && aiReply.length > 0) {
+            messageLines.push(aiReply);
+        } else {
+            messageLines.push("Thanks for your message.");
+        }
+
+        // Only ask for name/email if qualified (user requirement)
+        if (isQualified) {
+            // If name/email missing, ask specifically AFTER the answer
+            if (missingName) {
+                messageLines.push(""); // separate line for clarity if we want an empty line between answer and asks
+                messageLines.push("Please share your full name.");
+            }
+            if (missingEmail) {
+                // If both missing and we already added blank line, don't add another blank
+                if (!missingName) messageLines.push("");
+                messageLines.push("Please share your email address.");
+            }
+
+            // If qualified but not missing, acknowledge and confirm consultant will call
+            if (!missingName && !missingEmail) {
+                // keep concise acknowledgement
+                messageLines.push("");
+                messageLines.push("A consultant will call you shortly regarding your query.");
+            }
+        }
+
+        // Always ensure there is exactly one blank line before disclaimer
+        // If last line is not blank, push a blank line
+        if (messageLines.length === 0 || messageLines[messageLines.length - 1].trim() !== "") {
+            messageLines.push("");
+        }
+
+        messageLines.push("This is an AI generated reply");
+
+        const finalReplyText = messageLines.join("\n").trim();
+
+        // Update the raw message doc to trigger reply sending in whatsapp backend
         await doc.ref.update({
             processed: true,
             isLead,
             isQualified,
             priority: leadPriority,
-            autoReplyText: reply,
+            autoReplyText: finalReplyText,
             messageCount: totalMessages,
             replyPending: true,
             processing: false,
@@ -278,13 +310,12 @@ async function processMessage(doc) {
             }
         });
 
-        // Update or create Lead document
+        // Update or create Lead document if it's a lead
         const existingLeadSnap = await db.collection(LEADS_COLLECTION).where('leadKey', '==', leadKey).limit(1).get();
         const now = admin.firestore.Timestamp.now();
 
         if (isLead) {
             if (existingLeadSnap.empty) {
-                // Create new lead
                 await db.collection(LEADS_COLLECTION).add({
                     leadKey,
                     intent: normalizedIntent,
@@ -298,13 +329,13 @@ async function processMessage(doc) {
                     lastActive: now
                 });
             } else {
-                // Update existing lead
                 const leadRef = existingLeadSnap.docs[0].ref;
                 await leadRef.update({
                     intent: normalizedIntent,
                     messageCount: totalMessages,
                     lastActive: now,
-                    extracted: admin.firestore.FieldValue.arrayUnion(extracted || {}),
+                    // merged extraction - keep it simple (could be improved)
+                    extracted: { ...(existingLeadSnap.docs[0].data().extracted || {}), ...(extracted || {}) },
                     missingName,
                     missingEmail,
                     priority: leadPriority
@@ -317,7 +348,6 @@ async function processMessage(doc) {
 
     } catch (err) {
         console.error(`❌ Processing failed for ${docId}:`, err.message);
-        // ensure we free up the processing flag so it can be retried if needed
         await doc.ref.update({ processing: false });
     }
 }
